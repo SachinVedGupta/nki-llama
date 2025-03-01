@@ -18,10 +18,14 @@ from neuronx_distributed_inference.utils.accuracy import get_generate_outputs
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config, HuggingFaceGenerationAdapter
 from neuronx_distributed_inference.utils.random import set_random_seed
 
-from neuronx_distributed_inference.utils.benchmark import create_submodule_latency_collectors, register_latency_collectors, generate_report, generate_submodule_reports, Benchmark
+from neuronx_distributed_inference.utils.benchmark import create_submodule_latency_collectors, register_latency_collectors, generate_report, Benchmark
+
+# Load the baseline model 
+from neuronx_distributed_inference.models.llama import modeling_llama as baseline_llama
 
 # Load the model for ASPLOS contest
 from llama import NeuronLlamaForCausalLM
+from test import *
 
 BENCHMARK_REPORT_FILENAME = "benchmark_report.json"
 set_random_seed(0)
@@ -31,8 +35,10 @@ def parse_args():
     parser = argparse.ArgumentParser()
 
     # ASPLOS contest specific
-    parser.add_argument("--mode", choices=["evaluate", "validate", "generate"])
+    parser.add_argument("--mode", choices=["evaluate_single", "evaluate_all", "validate", "generate"])
     parser.add_argument("--enable-nki", action="store_true")
+    parser.add_argument("--base-latency", type=float, default=526.15)
+    parser.add_argument("--base-throughput", type=float, default=134.61)
 
     # Model path
     parser.add_argument("--model-path", type=str, default="/home/ubuntu/models/llama-3.2-1b/")
@@ -62,7 +68,7 @@ def parse_args():
     parser.add_argument("--seq-len", type=int, default=64)
     parser.add_argument("--n-active-tokens", type=int)
     parser.add_argument("--n-positions", type=int)
-    parser.add_argument("--max-context-length", type=int, default=32)
+    parser.add_argument("--max-context-length", type=int)
     parser.add_argument("--max-new-tokens", type=int)
     parser.add_argument("--max-length", type=int)
     parser.add_argument("--rpl-reduce-dtype", type=to_torch_dtype)
@@ -122,7 +128,6 @@ def prepare_inference(model_cls, args):
     if args.on_device_sampling:
         config_kwargs["on_device_sampling_config"] = OnDeviceSamplingConfig(**config_kwargs)
 
-    model_cls = NeuronLlamaForCausalLM
     neuron_config = model_cls.get_neuron_config_cls()(**config_kwargs)
 
     config = model_cls.get_config_cls()(
@@ -149,6 +154,7 @@ def prepare_inference(model_cls, args):
 
     # Load tokenizer.
     tokenizer = load_tokenizer(args.model_path, args.compiled_model_path, neuron_config)
+    neuron_config.pad_token_id = tokenizer.pad_token_id
 
     # Configure generation config.
     generation_config = GenerationConfig.from_pretrained(args.model_path)
@@ -166,6 +172,20 @@ def prepare_inference(model_cls, args):
     generation_config.update(**generation_config_kwargs)
 
     return model, tokenizer, generation_config
+
+
+def generate_submodule_reports(latency_collectors, neuron_config, num_runs):
+    reports = {}
+    for key, collector in latency_collectors.items():
+        tokens_len = neuron_config.max_length
+        if key == "context_encoding_model":
+            tokens_len = neuron_config.seq_len - neuron_config.max_new_tokens
+        elif key == "token_generation_model":
+            tokens_len = neuron_config.max_new_tokens
+        reports[key] = generate_report(
+            collector.latency_list, tokens_len, neuron_config.max_batch_size, num_runs
+        )
+    return reports
 
 
 def benchmark_sampling(model, tokenizer, generation_config, prompts):
@@ -196,11 +216,13 @@ def benchmark_sampling(model, tokenizer, generation_config, prompts):
     inputs = tokenizer(prompts, padding=True, return_tensors="pt")
     input_ids = inputs.input_ids
     attention_mask = inputs.attention_mask
+    neuron_config.max_new_tokens = neuron_config.seq_len - input_ids.shape[1]
 
     input_param = {
         "input_ids": input_ids,
         "generation_config": modified_generation_config,
         "attention_mask": attention_mask,
+        "min_new_tokens": neuron_config.max_new_tokens,
         "max_new_tokens": neuron_config.max_new_tokens,
         "top_k": 1,
         "do_sample": not neuron_config.enable_fused_speculation,
@@ -230,7 +252,7 @@ def benchmark_sampling(model, tokenizer, generation_config, prompts):
         neuron_config.max_batch_size,
         n_runs=e2e_benchmark.num_runs,
     )
-
+        
     report.update(
         generate_submodule_reports(
             latency_collectors, neuron_config, e2e_benchmark.num_runs
@@ -248,7 +270,7 @@ def benchmark_sampling(model, tokenizer, generation_config, prompts):
     return report
 
 
-def check_accuracy_logits(neuron_model, tokenizer, generation_config, prompts, divergence_difference_tol, tol_map, num_tokens_to_check):
+def check_accuracy_logits(base_model, base_generation_config, neuron_model, tokenizer, generation_config, prompts, divergence_difference_tol, tol_map, num_tokens_to_check):
     assert (prompts is not None)
 
     inputs = tokenizer(prompts, padding=True, return_tensors="pt")
@@ -256,20 +278,22 @@ def check_accuracy_logits(neuron_model, tokenizer, generation_config, prompts, d
     initial_attention_mask = inputs.attention_mask
     seq_len = neuron_model.config.neuron_config.seq_len
 
-    # Generate goldens with HF on CPU
-    # logit_validation assumes greedy sampling
-    hf_model = neuron_model.load_hf_model(neuron_model.model_path)
-    new_tokens = seq_len - inputs.input_ids.shape[1]
-    outputs = hf_model.generate(
-        inputs.input_ids,
-        max_new_tokens=new_tokens,
-        min_new_tokens=new_tokens,
-        do_sample=False,
-        attention_mask=inputs.attention_mask,
-        return_dict_in_generate=True,
-        output_scores=True,
-        generation_config=generation_config,
-    )
+    neuron_model.config.neuron_config.max_new_tokens = seq_len - initial_input_ids.shape[1]
+
+    # model = neuron_model.load_hf_model(neuron_model.model_path)
+    model = HuggingFaceGenerationAdapter(base_model)
+    new_tokens = neuron_model.config.neuron_config.max_new_tokens
+    with torch.inference_mode():
+        outputs = model.generate(
+            input_ids=initial_input_ids,
+            attention_mask=initial_attention_mask,
+            max_new_tokens=new_tokens,
+            min_new_tokens=new_tokens,
+            do_sample=False,
+            return_dict_in_generate=True,
+            output_scores=True,
+            generation_config=base_generation_config,
+        )
     expected_logits = torch.stack(outputs.scores)
 
     if num_tokens_to_check is not None:
@@ -319,13 +343,14 @@ def check_accuracy_logits(neuron_model, tokenizer, generation_config, prompts, d
         print("Actual Logits Shape: ", actual_logits.shape)
         return torch.stack(model_outputs.scores)
 
-    passed, results, status_msg = logit_validation(
+    passed, _, status_msg = logit_validation(
         input_ids=initial_input_ids,
         generate_fn=generate_fn,
         expected_logits=expected_logits,
         tol_map=tol_map,
         divergence_difference_tol=divergence_difference_tol,
     )
+    print("STATUS MSG", status_msg)
     assert passed, status_msg
 
     print("Passed logits validation")
@@ -350,6 +375,8 @@ def run_generation(model, tokenizer, prompts, generation_config):
 
 
 def run_accuracy_check(
+    base_model,
+    base_generation_config,
     model,
     tokenizer,
     generation_config,
@@ -363,9 +390,11 @@ def run_accuracy_check(
 
     try:
         check_accuracy_logits(
-            model,
-            tokenizer,
-            generation_config,
+            base_model=base_model,
+            base_generation_config=base_generation_config,
+            neuron_model=model,
+            tokenizer=tokenizer,
+            generation_config=generation_config,
             prompts=prompt,
             divergence_difference_tol=divergence_difference_tol,
             tol_map=tol_map,
@@ -465,16 +494,11 @@ def count_nki_flop_ratio(
     return nki_flop_ratio
 
 
-def calculate_score(accuracy, latency, throughput, nki_flop_ratio):
+def calculate_score(base_latency, base_throughput, accuracy, latency, throughput, nki_flop_ratio):
 
-    # latency and throughput
-    LATENCY_BASE = 255.51
-    THROUGHPUT_BASE = 260.33
+    increased_throughput = throughput / base_throughput
+    reduced_latency = base_latency / latency
 
-    increased_throughput = throughput / THROUGHPUT_BASE
-    reduced_latency = LATENCY_BASE / latency
-
-    # FIXME: adjust this calculation function
     final_score = accuracy * reduced_latency * increased_throughput * (1 + nki_flop_ratio)
 
     return final_score
@@ -485,7 +509,11 @@ def main():
     if not args.prompts:
         args.prompts = ["I believe the meaning of life is"]
     args.batch_size = len(args.prompts)
+    args.max_length = args.seq_len
+    args.tol_map = "{None: (1e-5, 0.05), 1000: (1e-5, 0.03), 50: (1e-5, 0.03), 5: (1e-5, 0.03)}"
+    
     model, tokenizer, generation_config = prepare_inference(NeuronLlamaForCausalLM, args)
+    base_model, _, base_generation_config = prepare_inference(baseline_llama.NeuronLlamaForCausalLM, args)
 
     if args.mode == "generate":
         run_generation(
@@ -498,6 +526,8 @@ def main():
     elif args.mode == "validate":
 
         passed = run_accuracy_check(
+            base_model,
+            base_generation_config,
             model,
             tokenizer,
             generation_config,
@@ -510,9 +540,11 @@ def main():
         status = "passed" if passed else "failed"
         print(f"Validation {status}.")
 
-    elif args.mode == "evaluate":
+    elif args.mode == "evaluate_single":
 
         accuracy = run_accuracy_check(
+            base_model,
+            base_generation_config,
             model,
             tokenizer,
             generation_config,
@@ -529,14 +561,61 @@ def main():
 
         nki_flop_ratio = count_nki_flop_ratio()
 
-        score = calculate_score(accuracy, latency, throughput, nki_flop_ratio)
+        score = calculate_score(args.base_latency, args.base_throughput, accuracy, latency, throughput, nki_flop_ratio)
         print(
+            f"Prompt: {args.prompts[0]}\n"
             f"Final Score: {score}\n"
             f"\tAccuracy: {accuracy}\n"
             f"\tLatency: {latency}\n"
             f"\tThroughput: {throughput}\n"
             f"\tNKI FLOPs Ratio: {nki_flop_ratio}"
         )
+        
+    elif args.mode == "evaluate_all":
+
+        prompts = parse_prompts("prompts.txt")
+        prompt_data = parse_prompt_data("prompt_data.txt")
+        assert len(prompts) == len(prompt_data)
+
+        total_score = 0
+
+        # Iterate through the prompts
+        for i, prompt in enumerate(prompts):
+            data = prompt_data[i]
+            base_latency = float(data[3])
+            base_throughput = float(data[4])
+
+            accuracy = run_accuracy_check(
+                base_model,
+                base_generation_config,
+                model,
+                tokenizer,
+                generation_config,
+                [prompt],
+                args.divergence_difference_tol,
+                args.tol_map,
+                num_tokens_to_check=args.num_tokens_to_check,
+            )
+
+            report = benchmark_sampling(model, tokenizer, generation_config, [prompt])
+
+            latency = report["e2e_model"]["latency_ms_p99"]
+            throughput = report["e2e_model"]["throughput"]
+
+            nki_flop_ratio = count_nki_flop_ratio()
+
+            score = calculate_score(base_latency, base_throughput, accuracy, latency, throughput, nki_flop_ratio)
+            print(
+                f"Prompt: {prompt}\n"
+                f"Final Score: {score}\n"
+                f"\tAccuracy: {accuracy}\n"
+                f"\tLatency: {latency}\n"
+                f"\tThroughput: {throughput}\n"
+                f"\tNKI FLOPs Ratio: {nki_flop_ratio}"
+            )
+            total_score += score
+
+        print(f"Total Score: {total_score}\n")
 
     else:
         assert False, "Undefined mode"

@@ -141,7 +141,7 @@ The following steps provide an example of how to utilize NKI kernels in the Llam
         return CustomRMSNormNKI if parallel_state.model_parallel_is_initialized() else LlamaRMSNorm
     ```
 
-1. Run inference using the NKI kernel and evaluation mode enabled by running `python main.py --enable-nki --mode evaluate`. If you would like to run the model with specific prompts, pass in `--prompt [PROMPTS]` where `[PROMPTS]` is a comma-separated list of prompts.
+1. Run inference on a single prompt using the NKI kernel and the single evaluation mode by running `python main.py --enable-nki --mode evaluate_single`. If you would like to run the model with specific prompts, pass in `--prompt [PROMPTS]` where `[PROMPTS]` is a comma-separated list of prompts.
 
 ## Additional Tools
 
@@ -156,9 +156,12 @@ Make your submission here: https://forms.gle/zZKKS6RzKcerf4vH8
 
 ## Benchmarks
 
-Submissions will be tested using 25 benchmarks (prompts) with varying context lengths (TBD, but likely 1K \-\> 128K) and batch sizes (TBD, but likely 1-\>4). We have provided 5 prompts in `prompts.txt`. The remaining 20 will be withheld for evaluation.
+Submissions will be tested using 25 benchmarks (prompts) with varying context lengths (TBD, but likely 1K \-\> 128K) and batch sizes (TBD, but likely 1-\>4). We have provided 5 prompts in `prompts.txt` with their corresponding metadata (prompt ID, prompt length, recommended sequence length, and baseline latency/throughput) in `prompt_data.txt`. There are 2 methods of testing these prompts:
 
-All benchmarks will become publicly available after the contest is complete.
+1. To avoid recompilation per prompt, you can use a global sequence length (we suggest 640) for all prompts. Run `python main.py --enable-nki --mode evaluate_all --seq-len 640`.
+2. Alternatively, you can use a unique sequence length for each prompt (suggested sequence lengths are the third entry in each row of `prompt_data.txt`) at the cost of recompiling the model for each prompt. Run `python test.py` to evaluate these prompts in this fashion.
+
+The remaining 20 prompts will be withheld for evaluation. All benchmarks will become publicly available after the contest is complete.
 
 ## Evaluation and Scoring
 
