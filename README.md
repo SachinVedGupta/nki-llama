@@ -1,5 +1,7 @@
 # NKI Llama
 
+📢 Contestants, please note that we have updated the due date to March 10, anywhere on Earth. This is to allow for more time to address questions about benchmarking, which is both the purpose of the competition and core to the success metric. 
+
 ## Getting Started
 
 This repository provides a package containing the PyTorch model of Llama 3.2 1B. This model **can be compiled with AWS Neuron SDK and run on** a **Trainium instance.** The main file in this package is `llama.py` which contains the model implementation in PyTorch.

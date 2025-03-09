@@ -512,8 +512,8 @@ def main():
     args.max_length = args.seq_len
     args.tol_map = "{None: (1e-5, 0.05), 1000: (1e-5, 0.03), 50: (1e-5, 0.03), 5: (1e-5, 0.03)}"
     
-    model, tokenizer, generation_config = prepare_inference(NeuronLlamaForCausalLM, args)
     base_model, _, base_generation_config = prepare_inference(baseline_llama.NeuronLlamaForCausalLM, args)
+    model, tokenizer, generation_config = prepare_inference(NeuronLlamaForCausalLM, args)
 
     if args.mode == "generate":
         run_generation(
