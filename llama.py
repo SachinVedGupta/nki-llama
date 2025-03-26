@@ -19,12 +19,18 @@
 # limitations under the License.
 """PyTorch LLaMA model for NXD inference."""
 import copy
+import sys
 import gc
 import logging
 import math
+import numpy as np
+import time
 from typing import List, Optional, Tuple, Type
 
+logger = logging.getLogger("Neuron")
+
 import torch
+from torch import Tensor, nn
 from neuronx_distributed.parallel_layers import parallel_state  # noqa: E402
 from neuronx_distributed.parallel_layers.layers import (  # noqa: E402; noqa: E402; noqa: E402; noqa: E402; noqa: E402
     ColumnParallelLinear,
@@ -76,14 +82,66 @@ from neuronx_distributed_inference.modules.flashdecode.utils import calculate_nu
 from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
 from neuronx_distributed_inference.utils.distributed import get_tp_group
 
+from neuronx_distributed_inference.modules.attention.utils import repeat_kv, manual_softmax
+
 from torch_neuronx.xla_impl.ops import RmsNorm
 
 import neuronxcc.nki as nki
 import neuronxcc.nki.language as nl
+import neuronxcc.nki.isa as nisa
 
+import os
+from torch_xla.core import xla_model as xm
+
+
+SIMPLE_PROFILE = False
 _LLAMA_MODULE_MAP = {}
 
-logger = logging.getLogger("Neuron")
+# logger = logging.getLogger("Neuron")
+# logger.setLevel(level=logging.DEBUG)
+# handler = logging.FileHandler("./app.log", encoding='UTF-8')
+# handler.setLevel(logging.DEBUG)
+# formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# handler.setFormatter(formatter)
+# logger.addHandler(handler)
+
+@nki.jit
+def matmul_test(lhs_small, rhs_small, size1, size2):
+    nki_lhs_small = nl.load(lhs_small[:, :])
+    nki_rhs_small = nl.load(rhs_small[:, :])
+    # _, size1 = lhs_small.shape
+    # _, size2 = rhs_small.shape
+    res_psum = nl.zeros((size1, size2), nl.float32, buffer=nl.psum)
+    res_psum = nl.matmul(nki_lhs_small, nki_rhs_small, transpose_x=True)
+    result = nl.ndarray((size1, size2), dtype=lhs_small.dtype, buffer=nl.shared_hbm)
+    nl.store(result[:, :], value=res_psum)
+    return result
+
+
+def block_matmul(A, B, block_size=512, block_size_1=128):
+    m, k = A.shape
+    k, n = B.shape
+    # original_dtype = A.dtype
+    # A = A.to(torch.float32)
+    # B = B.to(torch.float32)
+    # device = xm.xla_device()
+    # A = A.to(device)
+    # B = B.to(device)
+
+    result = torch.zeros((m, n), dtype = A.dtype, device=A.device)
+
+    for i in range(0, m, block_size_1):
+        for j in range(0, n, block_size):
+            for l in range(0, k, block_size_1):
+                A_block = A[i:i+block_size_1, l:l+block_size_1]
+                B_block = B[l:l+block_size_1, j:j+block_size]
+                m1, k1 = A_block.shape
+                k1, n1 = B_block.shape
+
+                result[i:i+block_size_1, j:j+block_size] += matmul_test(A_block.T, B_block, m1, n1)
+    # using torch.matmul instead of nki.matmul causes NKI FLOPS to go to 0
+    # result = result.to(original_dtype)
+    return result 
 
 
 @nki.jit
@@ -755,6 +813,30 @@ class NeuronLlamaAttention(NeuronAttentionBase):
                 self.rotary_emb = LlamaRotaryEmbedding(self.config)
 
 
+    def scaled_qk(self, Q, K, attention_mask): # computing the scaled dot-product attention scores using NKI (block_matmul --> uses NKI matmul)
+        ## [32,64] [64,32]
+        bs, head, sequence, dimension = Q.size()
+        _, head_k, sequence_k, dimension_k = K.size()
+        # print("size:", sequence)
+        # print("size2:", sequence_k)
+        result = torch.zeros((bs, head, sequence, sequence_k), device = Q.device, dtype=Q.dtype)
+        # print("Q.type:", Q.dtype)
+        for i in range(bs):
+            for j in range(head):
+                temp_q = Q[i, j, :, :]
+                temp_k = (K.transpose(2, 3))[i, j, :, :]
+                # print("temp_q", temp_q.size())
+                # print("temp_k", temp_k.size())
+                temp = block_matmul(temp_q, temp_k)
+                result[i, j, :, :] = temp
+        QK = result / math.sqrt(self.head_dim)
+
+        # QK = torch.matmul(Q, K.transpose(2, 3)) / math.sqrt(self.head_dim)
+        QK = torch.where(attention_mask, QK, torch.finfo(QK.dtype).min)
+        return QK
+
+
+
 # TODO: Modularize RotaryEmbedding. See how HF transformers does it in 4.43.
 class Llama3RotaryEmbedding(nn.Module):
     """
@@ -945,6 +1027,8 @@ class ResBlock(nn.Module):
             torch.Tensor: Output after the residual connection and activation.
         """
         return x + self.act(self.linear(x))
+    
+
 
 
 class NeuronLlamaModel(NeuronBaseModel):
