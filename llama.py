@@ -19,18 +19,15 @@
 # limitations under the License.
 """PyTorch LLaMA model for NXD inference."""
 import copy
-import sys
 import gc
 import logging
 import math
-import numpy as np
-import time
 from typing import List, Optional, Tuple, Type
 
 logger = logging.getLogger("Neuron")
 
 import torch
-from torch import Tensor, nn
+from torch import nn
 from neuronx_distributed.parallel_layers import parallel_state  # noqa: E402
 from neuronx_distributed.parallel_layers.layers import (  # noqa: E402; noqa: E402; noqa: E402; noqa: E402; noqa: E402
     ColumnParallelLinear,
@@ -82,20 +79,14 @@ from neuronx_distributed_inference.modules.flashdecode.utils import calculate_nu
 from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
 from neuronx_distributed_inference.utils.distributed import get_tp_group
 
-from neuronx_distributed_inference.modules.attention.utils import repeat_kv, manual_softmax
-
 from torch_neuronx.xla_impl.ops import RmsNorm
 
 import neuronxcc.nki as nki
 import neuronxcc.nki.language as nl
-import neuronxcc.nki.isa as nisa
-
-import os
-from torch_xla.core import xla_model as xm
-
 
 SIMPLE_PROFILE = False
 _LLAMA_MODULE_MAP = {}
+
 
 # logger = logging.getLogger("Neuron")
 # logger.setLevel(level=logging.DEBUG)
@@ -105,29 +96,29 @@ _LLAMA_MODULE_MAP = {}
 # handler.setFormatter(formatter)
 # logger.addHandler(handler)
 
-@nki.jit
-def matmul_test(lhs_small, rhs_small, size1, size2):
-    nki_lhs_small = nl.load(lhs_small[:, :])
-    nki_rhs_small = nl.load(rhs_small[:, :])
-    # _, size1 = lhs_small.shape
-    # _, size2 = rhs_small.shape
-    res_psum = nl.zeros((size1, size2), nl.float32, buffer=nl.psum)
-    res_psum = nl.matmul(nki_lhs_small, nki_rhs_small, transpose_x=True)
-    result = nl.ndarray((size1, size2), dtype=lhs_small.dtype, buffer=nl.shared_hbm)
-    nl.store(result[:, :], value=res_psum)
+
+# Optimized NKI matrix multiplication compared to torch.matmul
+# refer to https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/nki/tutorials/matrix_multiplication.html
+# for small input matrices/tensors
+@nki.jit 
+def matmul_nki(lhs, rhs, size_lhs, size_rhs):
+    nki_lhs = nl.load(lhs[:, :])
+    nki_rhs = nl.load(rhs[:, :])
+
+    result_psum = nl.zeros((size_lhs, size_rhs), nl.float32, buffer=nl.psum)
+    result_psum = nl.matmul(nki_lhs, nki_rhs, transpose_x=True)
+
+    result = nl.ndarray((size_lhs, size_rhs), dtype=lhs.dtype, buffer=nl.shared_hbm)
+    nl.store(result[:, :], value=result_psum)
     return result
 
 
-def block_matmul(A, B, block_size=512, block_size_1=128):
+# Optimized multiplication of large matrices using block matrix multiplication and NKI matmul
+def block_matmul_nki(A, B, block_size=512, block_size_1=128):
     m, k = A.shape
     k, n = B.shape
-    # original_dtype = A.dtype
-    # A = A.to(torch.float32)
-    # B = B.to(torch.float32)
-    # device = xm.xla_device()
-    # A = A.to(device)
-    # B = B.to(device)
 
+    # create empty result tensor/matrix
     result = torch.zeros((m, n), dtype = A.dtype, device=A.device)
 
     for i in range(0, m, block_size_1):
@@ -138,7 +129,9 @@ def block_matmul(A, B, block_size=512, block_size_1=128):
                 m1, k1 = A_block.shape
                 k1, n1 = B_block.shape
 
-                result[i:i+block_size_1, j:j+block_size] += matmul_test(A_block.T, B_block, m1, n1)
+                # apply matmul_nki to each (small) block
+                result[i:i+block_size_1, j:j+block_size] += matmul_nki(A_block.T, B_block, m1, n1)
+    
     # using torch.matmul instead of nki.matmul causes NKI FLOPS to go to 0
     # result = result.to(original_dtype)
     return result 
@@ -813,7 +806,7 @@ class NeuronLlamaAttention(NeuronAttentionBase):
                 self.rotary_emb = LlamaRotaryEmbedding(self.config)
 
 
-    def scaled_qk(self, Q, K, attention_mask): # computing the scaled dot-product attention scores using NKI (block_matmul --> uses NKI matmul)
+    def scaled_qk(self, Q, K, attention_mask): # computing the scaled dot-product attention scores using NKI (block_matmul_nki --> uses NKI matmul)
         ## [32,64] [64,32]
         bs, head, sequence, dimension = Q.size()
         _, head_k, sequence_k, dimension_k = K.size()
@@ -827,7 +820,7 @@ class NeuronLlamaAttention(NeuronAttentionBase):
                 temp_k = (K.transpose(2, 3))[i, j, :, :]
                 # print("temp_q", temp_q.size())
                 # print("temp_k", temp_k.size())
-                temp = block_matmul(temp_q, temp_k)
+                temp = block_matmul_nki(temp_q, temp_k)
                 result[i, j, :, :] = temp
         QK = result / math.sqrt(self.head_dim)
 
